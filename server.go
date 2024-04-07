@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 	"github.com/things-go/go-socks5/statute"
@@ -57,7 +61,17 @@ type Server struct {
 	userConnectHandle   func(ctx context.Context, writer io.Writer, request *Request) error
 	userBindHandle      func(ctx context.Context, writer io.Writer, request *Request) error
 	userAssociateHandle func(ctx context.Context, writer io.Writer, request *Request) error
+
+	mu         sync.Mutex
+	listeners  map[*net.Listener]struct{}
+	activeConn map[net.Conn]struct{}
+	inShutdown atomic.Bool // true when server is in shutdown
+	onShutdown []func()
+
+	listenerGroup sync.WaitGroup
 }
+
+var ErrServerClosed = errors.New("socks5: Server closed")
 
 // NewServer creates a new Server
 func NewServer(opts ...Option) *Server {
@@ -84,8 +98,15 @@ func NewServer(opts ...Option) *Server {
 	return srv
 }
 
+func (s *Server) shuttingDown() bool {
+	return s.inShutdown.Load()
+}
+
 // ListenAndServe is used to create a listener and serve on it
 func (sf *Server) ListenAndServe(network, addr string) error {
+	if sf.shuttingDown() {
+		return ErrServerClosed
+	}
 	l, err := net.Listen(network, addr)
 	if err != nil {
 		return err
@@ -158,8 +179,119 @@ func (sf *Server) ServeConn(conn net.Conn) error {
 	request.AuthContext = authContext
 	request.LocalAddr = conn.LocalAddr()
 	request.RemoteAddr = conn.RemoteAddr()
+	// Track the connection
+	sf.trackConn(conn, true)
 	// Process the client request
-	return sf.handleRequest(conn, request)
+	if err := sf.handleRequest(conn, request); err != nil {
+		return err
+	}
+
+	sf.trackConn(conn, false)
+
+	return nil
+}
+
+func (s *Server) trackListener(ln *net.Listener, add bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listeners == nil {
+		s.listeners = make(map[*net.Listener]struct{})
+	}
+	if add {
+		if s.shuttingDown() {
+			return false
+		}
+		s.listeners[ln] = struct{}{}
+		s.listenerGroup.Add(1)
+	} else {
+		delete(s.listeners, ln)
+		s.listenerGroup.Done()
+	}
+	return true
+}
+
+func (sf *Server) closeListenersLocked() error {
+	var err error
+	for ln := range sf.listeners {
+		if cerr := (*ln).Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
+}
+
+func (s *Server) trackConn(c net.Conn, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeConn == nil {
+		s.activeConn = make(map[net.Conn]struct{})
+	}
+	if add {
+		s.activeConn[c] = struct{}{}
+	} else {
+		delete(s.activeConn, c)
+	}
+}
+
+// RegisterOnShutdown registers a function to call on Shutdown.
+func (srv *Server) RegisterOnShutdown(f func()) {
+	srv.mu.Lock()
+	srv.onShutdown = append(srv.onShutdown, f)
+	srv.mu.Unlock()
+}
+
+func (s *Server) closeConns() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	quiescent := true
+	for c := range s.activeConn {
+		// Forcefully close connection discarding any error
+		c.Close()
+		delete(s.activeConn, c)
+	}
+
+	return quiescent
+}
+
+const shutdownPollIntervalMax = 500 * time.Millisecond
+
+// Shutdown gracefully shuts down the server without interrupting any active connection.
+func (srv *Server) Shutdown(ctx context.Context) error {
+	srv.inShutdown.Store(true)
+
+	srv.mu.Lock()
+	lnerr := srv.closeListenersLocked()
+	for _, f := range srv.onShutdown {
+		go f()
+	}
+	srv.mu.Unlock()
+	srv.listenerGroup.Wait()
+
+	pollIntervalBase := time.Millisecond
+	nextPollInterval := func() time.Duration {
+		// Add 10% jitter.
+		interval := pollIntervalBase + time.Duration(rand.Intn(int(pollIntervalBase/10)))
+		// Double and clamp for next time.
+		pollIntervalBase *= 2
+		if pollIntervalBase > shutdownPollIntervalMax {
+			pollIntervalBase = shutdownPollIntervalMax
+		}
+		return interval
+	}
+
+	timer := time.NewTimer(nextPollInterval())
+	defer timer.Stop()
+	for {
+		if srv.closeConns() {
+			return lnerr
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			timer.Reset(nextPollInterval())
+		}
+	}
 }
 
 // authenticate is used to handle connection authentication
